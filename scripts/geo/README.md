@@ -6,9 +6,9 @@ This directory contains scripts for controlled, reproducible ingestion of offici
 
 ## 1. Source Files & Provenance
 
-* **Main Place Lookup**: `MainPlace/MainPlaceLookupTable.xls` (3,109 rows)
-* **Sub Place Lookup**: `SubPlace/SubPlaceLookupTable.xls` (21,243 rows)
-* **Provenance Defaults**:
+* **Main Place Lookup**: `MainPlace/MainPlaceLookupTable.xls` (3,109 data rows)
+* **Sub Place Lookup**: `SubPlace/SubPlaceLookupTable.xls` (21,243 data rows)
+* **Provenance Metadata**:
   * `dataset_name`: `'Stats SA 2011 Census'`
   * `dataset_version`: `'v2011.1'`
   * `observed_at`: UTC execution timestamp
@@ -30,27 +30,32 @@ python scripts/geo/import_stats_sa.py --dbname gov_intel_test --port 54339
 
 ---
 
-## 3. Structural Validation & Anomaly Quarantine
+## 3. Ingestion Accounting Semantics
 
-The ingestion script enforces strict validation rules:
-1. **Pre-Validation**: File existence, exact header columns, non-empty names, positive codes, and province codes strictly between 1 and 9.
-2. **Deterministic Parent Derivation**: Each Sub Place derives its parent Main Place code via integer division (`SP_CODE // 1000`).
-3. **Known Anomaly Quarantine**:
-   - The official Stats SA file contains exactly **2 orphaned rural Sub Places**:
-     * `11497004` (`Swellendam NU`) -> Derived parent MP `11497`
-     * `12332002` (`Prince Albert NU`) -> Derived parent MP `12332`
-   - These parent codes are absent from the Main Place file.
-   - The ingestion script **explicitly quarantines and logs** these two records without inserting them and **without fabricating fake parent records**.
-   - Any unexpected/unregistered orphan triggers a fail-closed `IngestionValidationError` prior to database execution.
-4. **Idempotency**: All inserts execute in an atomic transaction using `ON CONFLICT (code) DO UPDATE` to ensure safe, repeatable execution without duplicate rows or key errors.
+The ingestion engine uses an atomic staging mechanism to calculate exact database operations:
+* **`inserted`**: Genuinely newly created rows inserted into the table.
+* **`updated`**: Pre-existing rows matched by unique constraint (`mp_code` or `sp_code`) and refreshed via `ON CONFLICT DO UPDATE`.
+* **`quarantined`**: Source rows deliberately excluded from database insertion due to verified source anomalies.
+
+### Fresh Ingestion (Empty Tables):
+* **Main Places**: `inserted: 3109`, `updated: 0`
+* **Sub Places**: `inserted: 21241`, `updated: 0`
+* **Quarantined**: `2`
+
+### Repeat Ingestion (Populated Tables):
+* **Main Places**: `inserted: 0`, `updated: 3109`
+* **Sub Places**: `inserted: 0`, `updated: 21241`
+* **Quarantined**: `2`
 
 ---
 
-## 4. Expected Results
+## 4. Known Source Anomaly Quarantine
 
-* **`main_places` Table**: Exactly **3,109** records inserted.
-* **`sub_places` Table**: Exactly **21,241** records inserted.
-* **Orphan Records**: Exactly **2** records quarantined and reported.
+The official Stats SA file contains exactly **2 orphaned rural Sub Places**:
+* `11497004` (`Swellendam NU`) -> Derived parent MP `11497`
+* `12332002` (`Prince Albert NU`) -> Derived parent MP `12332`
+
+These parent codes are absent from the Main Place file. The ingestion script **explicitly quarantines and logs** these two records without inserting them and **without fabricating fake parent records**. Any unexpected/unregistered orphan triggers a fail-closed `IngestionValidationError` prior to database execution.
 
 ---
 

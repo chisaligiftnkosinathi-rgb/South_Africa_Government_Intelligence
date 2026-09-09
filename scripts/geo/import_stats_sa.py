@@ -3,6 +3,7 @@ Controlled Stats SA Geographic Ingestion Script
 ================================================
 Reads official Stats SA MainPlace and SubPlace XLS files, validates structure and constraints,
 and loads them idempotently into PostgreSQL (main_places, sub_places).
+Accurately accounts for inserted vs updated vs unchanged vs quarantined rows.
 Explicitly identifies and quarantines known source anomalies without fabrication or silent discarding.
 """
 
@@ -145,7 +146,6 @@ def validate_and_parse_sub_places(file_path: str, valid_mp_codes: set):
         if derived_mp in valid_mp_codes:
             valid_records.append(record)
         else:
-            # Check if this is an expected/known source anomaly
             orphan_records.append(record)
             if sp_code not in KNOWN_ORPHAN_SP_CODES:
                 raise IngestionValidationError(
@@ -176,24 +176,43 @@ def run_ingestion(conn, main_place_path: str, sub_place_path: str,
         "sp_source_rows": len(sp_records) + len(sp_orphans),
         "mp_validated_count": len(mp_records),
         "sp_validated_count": len(sp_records),
-        "orphan_count": len(sp_orphans),
+        "quarantined_count": len(sp_orphans),
         "orphan_sp_codes": [o["sp_code"] for o in sp_orphans],
         "orphan_details": [
             {"sp_code": o["sp_code"], "sp_name": o["sp_name"], "derived_mp": o["main_place_code"], "mun": o["municipality_name"]}
             for o in sp_orphans
         ],
         "mp_inserted": 0,
+        "mp_updated": 0,
         "sp_inserted": 0,
+        "sp_updated": 0,
         "final_db_mp_count": 0,
         "final_db_sp_count": 0
     }
     
-    # 2. Database Transaction (Atomic & Idempotent via ON CONFLICT DO UPDATE)
+    # 2. Database Transaction (Atomic with Staging Accounting)
     with conn:
         with conn.cursor() as cur:
-            # Insert/Update Main Places
-            mp_sql = """
-                INSERT INTO main_places (
+            # Create staging tables for accurate accounting
+            cur.execute("""
+                CREATE TEMP TABLE stage_main_places (
+                    mp_code INTEGER, mp_name TEXT, municipality_code INTEGER, municipality_name TEXT,
+                    district_code INTEGER, district_name TEXT, province_code INTEGER, province_name TEXT,
+                    dataset_name TEXT, dataset_version TEXT, observed_at TIMESTAMPTZ
+                ) ON COMMIT DROP;
+            """)
+            
+            cur.execute("""
+                CREATE TEMP TABLE stage_sub_places (
+                    sp_code BIGINT, sp_name TEXT, main_place_code INTEGER, municipality_code INTEGER, municipality_name TEXT,
+                    district_code INTEGER, district_name TEXT, province_code INTEGER, province_name TEXT,
+                    dataset_name TEXT, dataset_version TEXT, observed_at TIMESTAMPTZ
+                ) ON COMMIT DROP;
+            """)
+            
+            # Populate Staging Main Places
+            mp_stage_sql = """
+                INSERT INTO stage_main_places (
                     mp_code, mp_name, municipality_code, municipality_name,
                     district_code, district_name, province_code, province_name,
                     dataset_name, dataset_version, observed_at
@@ -201,7 +220,54 @@ def run_ingestion(conn, main_place_path: str, sub_place_path: str,
                     %(mp_code)s, %(mp_name)s, %(municipality_code)s, %(municipality_name)s,
                     %(district_code)s, %(district_name)s, %(province_code)s, %(province_name)s,
                     %(dataset_name)s, %(dataset_version)s, %(observed_at)s
+                );
+            """
+            mp_payload = [
+                {**r, "dataset_name": dataset_name, "dataset_version": dataset_version, "observed_at": observed_at}
+                for r in mp_records
+            ]
+            psycopg2.extras.execute_batch(cur, mp_stage_sql, mp_payload, page_size=1000)
+            
+            # Populate Staging Sub Places
+            sp_stage_sql = """
+                INSERT INTO stage_sub_places (
+                    sp_code, sp_name, main_place_code, municipality_code, municipality_name,
+                    district_code, district_name, province_code, province_name,
+                    dataset_name, dataset_version, observed_at
+                ) VALUES (
+                    %(sp_code)s, %(sp_name)s, %(main_place_code)s, %(municipality_code)s, %(municipality_name)s,
+                    %(district_code)s, %(district_name)s, %(province_code)s, %(province_name)s,
+                    %(dataset_name)s, %(dataset_version)s, %(observed_at)s
+                );
+            """
+            sp_payload = [
+                {**r, "dataset_name": dataset_name, "dataset_version": dataset_version, "observed_at": observed_at}
+                for r in sp_records
+            ]
+            psycopg2.extras.execute_batch(cur, sp_stage_sql, sp_payload, page_size=2000)
+            
+            # Compute Insert vs Update for Main Places
+            cur.execute("""
+                SELECT 
+                    COUNT(s.mp_code) FILTER (WHERE m.mp_code IS NULL) AS to_insert,
+                    COUNT(s.mp_code) FILTER (WHERE m.mp_code IS NOT NULL) AS to_update
+                FROM stage_main_places s
+                LEFT JOIN main_places m ON m.mp_code = s.mp_code;
+            """)
+            mp_to_insert, mp_to_update = cur.fetchone()
+            
+            # Merge Main Places
+            cur.execute("""
+                INSERT INTO main_places (
+                    mp_code, mp_name, municipality_code, municipality_name,
+                    district_code, district_name, province_code, province_name,
+                    dataset_name, dataset_version, observed_at
                 )
+                SELECT 
+                    mp_code, mp_name, municipality_code, municipality_name,
+                    district_code, district_name, province_code, province_name,
+                    dataset_name, dataset_version, observed_at
+                FROM stage_main_places
                 ON CONFLICT (mp_code) DO UPDATE SET
                     mp_name = EXCLUDED.mp_name,
                     municipality_code = EXCLUDED.municipality_code,
@@ -213,25 +279,32 @@ def run_ingestion(conn, main_place_path: str, sub_place_path: str,
                     dataset_name = EXCLUDED.dataset_name,
                     dataset_version = EXCLUDED.dataset_version,
                     observed_at = EXCLUDED.observed_at;
-            """
-            mp_payload = [
-                {**r, "dataset_name": dataset_name, "dataset_version": dataset_version, "observed_at": observed_at}
-                for r in mp_records
-            ]
-            psycopg2.extras.execute_batch(cur, mp_sql, mp_payload, page_size=1000)
-            report["mp_inserted"] = len(mp_payload)
+            """)
+            report["mp_inserted"] = mp_to_insert
+            report["mp_updated"] = mp_to_update
             
-            # Insert/Update Valid Sub Places
-            sp_sql = """
+            # Compute Insert vs Update for Sub Places
+            cur.execute("""
+                SELECT 
+                    COUNT(s.sp_code) FILTER (WHERE sp.sp_code IS NULL) AS to_insert,
+                    COUNT(s.sp_code) FILTER (WHERE sp.sp_code IS NOT NULL) AS to_update
+                FROM stage_sub_places s
+                LEFT JOIN sub_places sp ON sp.sp_code = s.sp_code;
+            """)
+            sp_to_insert, sp_to_update = cur.fetchone()
+            
+            # Merge Sub Places
+            cur.execute("""
                 INSERT INTO sub_places (
                     sp_code, sp_name, main_place_code, municipality_code, municipality_name,
                     district_code, district_name, province_code, province_name,
                     dataset_name, dataset_version, observed_at
-                ) VALUES (
-                    %(sp_code)s, %(sp_name)s, %(main_place_code)s, %(municipality_code)s, %(municipality_name)s,
-                    %(district_code)s, %(district_name)s, %(province_code)s, %(province_name)s,
-                    %(dataset_name)s, %(dataset_version)s, %(observed_at)s
                 )
+                SELECT 
+                    sp_code, sp_name, main_place_code, municipality_code, municipality_name,
+                    district_code, district_name, province_code, province_name,
+                    dataset_name, dataset_version, observed_at
+                FROM stage_sub_places
                 ON CONFLICT (sp_code) DO UPDATE SET
                     sp_name = EXCLUDED.sp_name,
                     main_place_code = EXCLUDED.main_place_code,
@@ -244,15 +317,11 @@ def run_ingestion(conn, main_place_path: str, sub_place_path: str,
                     dataset_name = EXCLUDED.dataset_name,
                     dataset_version = EXCLUDED.dataset_version,
                     observed_at = EXCLUDED.observed_at;
-            """
-            sp_payload = [
-                {**r, "dataset_name": dataset_name, "dataset_version": dataset_version, "observed_at": observed_at}
-                for r in sp_records
-            ]
-            psycopg2.extras.execute_batch(cur, sp_sql, sp_payload, page_size=2000)
-            report["sp_inserted"] = len(sp_payload)
+            """)
+            report["sp_inserted"] = sp_to_insert
+            report["sp_updated"] = sp_to_update
             
-            # Verification Query on Final Counts
+            # Authoritative Final Database Totals
             cur.execute("SELECT COUNT(*) FROM main_places;")
             report["final_db_mp_count"] = cur.fetchone()[0]
             
@@ -273,15 +342,17 @@ def print_report(report: dict):
     print("-" * 60)
     print(f"Source Main Places  : {report['mp_source_rows']}")
     print(f"Validated MP Count  : {report['mp_validated_count']}")
-    print(f"DB MP Inserted/Upd  : {report['mp_inserted']}")
+    print(f"DB MP Inserted      : {report['mp_inserted']}")
+    print(f"DB MP Updated       : {report['mp_updated']}")
     print(f"Final DB MP Total   : {report['final_db_mp_count']}")
     print("-" * 60)
     print(f"Source Sub Places   : {report['sp_source_rows']}")
     print(f"Validated SP Count  : {report['sp_validated_count']}")
-    print(f"DB SP Inserted/Upd  : {report['sp_inserted']}")
+    print(f"DB SP Inserted      : {report['sp_inserted']}")
+    print(f"DB SP Updated       : {report['sp_updated']}")
     print(f"Final DB SP Total   : {report['final_db_sp_count']}")
     print("-" * 60)
-    print(f"Orphan Sub Places   : {report['orphan_count']}")
+    print(f"Quarantined Orphans : {report['quarantined_count']}")
     print(f"Orphan SP Codes     : {report['orphan_sp_codes']}")
     if report["orphan_details"]:
         print("Orphan Details (Quarantined, not inserted):")
