@@ -1,4 +1,4 @@
-﻿# Database Schema & Migration Guide (v0.4.1)
+﻿# Database Schema & Migration Guide
 
 This directory contains the canonical PostgreSQL/Supabase database migrations for the South African Government Intelligence & Civic Platform.
 
@@ -8,91 +8,64 @@ This directory contains the canonical PostgreSQL/Supabase database migrations fo
 
 | Order | Migration File | Scope & Purpose |
 | :--- | :--- | :--- |
-| **01** | `20260909000001_initial_core_schema.sql` | Core Schema v0.4.1: Custom Enums, Entity Registry, Evidence Layer, Claim Store, First-Class Canonical Relationships, Domain Entities, Authority Rules Engine, and Invariant Constraints. |
+| **01** | `20260909000001_initial_core_schema.sql` | **Core Governance Schema v0.4.1**: Entity Registry, Evidence Layer, Claim Store, First-Class Canonical Relationships, Domain Entities (`institutions`, `offices`, `people`, `institution_functions`, `wards`, `tenders`, `awards`, `suppliers`), and Authority Rules Engine. |
+| **02** | `20260909000002_geographic_reference_layer.sql` | **Geographic Reference Layer**: Stats SA Census `main_places` and `sub_places`. Completely decoupled from the governance graph (zero FKs to entities or institutions). |
 
 ### To Run in Supabase:
 * Using Supabase CLI:
   ```bash
-  supabase db reset
-  # or
   supabase migration up
   ```
 * Direct execution on PostgreSQL / Supabase SQL Editor:
-  Execute `supabase/migrations/20260909000001_initial_core_schema.sql`.
+  Execute migrations sequentially in alphabetical order.
 
 ---
 
-## 2. Table Dependency & Referential Architecture
+## 2. Table Dependency & Architecture Separation
 
-The schema adheres to strict, topological foreign-key hierarchies:
+The database deliberately isolates the **Governance Graph** from the **Geographic Reference Layer**:
 
 ```text
-               ┌───────────────┐
-               │    sources    │
-               └───────┬───────┘
-                       │ (1:N)
-                       ▼
-               ┌───────────────────────┐
-               │   evidence_records    │ ◄── [Append-Only Trigger]
-               └───────┬───────────────┘
-                       │
-         ┌─────────────┴──────────────┐
-         │                            │
-         ▼                            ▼
-  ┌──────────────┐             ┌──────────────┐
-  │   claims     │             │ authority_   │
-  └──────┬───────┘             │    rules     │
-         │                     └──────┬───────┘
-         ├────────────────────────┐   │
-         ▼                        ▼   ▼
-  ┌──────────────┐             ┌───────────────────────┐
-  │   entities   │             │ relationship_evidence │
-  └──────┬───────┘             └───────────▲───────────┘
-         │ (Inheritance PKs)               │ (1:N FK)
-    ┌────┴────────────────────────┐        │
-    ▼                             ▼        │
-[Domain Tables]             ┌──────────────┴────────┐
-(institutions, offices,     │     relationships     │
- people, functions, wards,  └───────────────────────┘
- tenders, awards, suppliers)
+========================================
+1. GOVERNANCE GRAPH LAYER (Migration 01)
+========================================
+sources ──> evidence_records ──> claims
+                                    │
+    ┌───────────────────────────────┴──────────────────────────────┐
+    ▼                                                              ▼
+entities (PK substrate)                                      authority_rules
+    │                                                              │
+    ├─► [Domain Entities]                                          │
+    │   (institutions, offices, people, functions, wards, etc.)    │
+    │                                                              │
+    └─► relationships ◄── relationship_evidence ◄──────────────────┘
+
+=============================================
+2. GEOGRAPHIC REFERENCE LAYER (Migration 02)
+=============================================
+main_places (Stats SA MP_CODE)
+    │ (1:N FK via mp_code)
+    ▼
+sub_places (Stats SA SP_CODE)
+
+* INVARIANT: No foreign keys exist between the Geographic Reference Layer
+  and the Governance Graph. They are connected exclusively through explicit
+  cross-reference queries or resolution models.
 ```
 
 ---
 
-## 3. Major Invariants Implemented
+## 3. Running Verification Tests Locally
 
-1. **No Polymorphic Foreign Keys**:
-   - Universal graph edges are represented in `relationships`.
-   - `source_entity_id` and `target_entity_id` strictly reference `entities(id)`.
-   - `relationship_evidence.relationship_id` strictly references `relationships(id)`.
-2. **Entity Inheritance**:
-   - Domain entity tables (`institutions`, `offices`, `people`, `institution_functions`, `wards`, `tenders`, `awards`, `suppliers`) use `id UUID PRIMARY KEY REFERENCES entities(id) ON DELETE RESTRICT`.
-3. **Canonical Relationship Identity & Deduplication**:
-   - Enforced by unique constraint:
-     `CONSTRAINT uq_relationship_identity UNIQUE (source_entity_id, relationship_predicate, target_entity_id, effective_from)`.
-4. **Decoupled Claim Vectors**:
-   - `processing_stage`: `extracted`, `normalized`, `resolved`, `validated`, `canonicalized`.
-   - `assertion_status`: `unverified`, `substantiated`, `contested`, `superseded`, `revoked`.
-5. **Contextual Authority Ordering**:
-   - `authority_rules.authority_rank`: integer precedence within a specific `(claim_predicate, source_type, statutory_instrument)` scope.
-6. **Immutable Evidence Snapshots**:
-   - Trigger `trg_prevent_evidence_records_mutation` blocks any `UPDATE` or `DELETE` operations on `evidence_records`.
+The test suite in `tests/schema/` tests all invariants across both layers:
 
----
-
-## 4. Running Verification Tests Locally
-
-A test suite verifying all schema invariants is located in `tests/schema/test_schema_invariants.py`.
-
-To run the tests:
 ```bash
+# Test Core Governance Schema invariants (FKs, inheritance, deduplication, historical claims)
 python tests/schema/test_schema_invariants.py -v
-```
 
-### Verified Scenarios:
-* **Test A**: Invalid relationship FK target fails.
-* **Test B**: Domain entity referencing nonexistent `entities.id` fails.
-* **Test C**: Duplicate relationship edge insertion fails.
-* **Test D**: Extraction confidence (`0.0 - 1.0`) and date order (`effective_to >= effective_from`) check constraints.
-* **Test E**: Provenance bridge rejects nonexistent relationship, claim, or evidence records.
-* **Test F**: Historical claims remain preserved and linked via `superseded_by_claim_id` upon supersedence.
+# Test Geographic Reference Layer invariants (place uniqueness, code checks, decoupling)
+python tests/schema/test_geographic_schema.py -v
+
+# Validate source Stats SA Excel data files without inserting into DB
+python tests/schema/validate_stats_sa_source_files.py
+```
