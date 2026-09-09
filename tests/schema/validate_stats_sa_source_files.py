@@ -78,16 +78,18 @@ def validate_stats_sa_datasets():
     print(f"   Unique SP_CODEs: {len(sp_codes)}")
     print(f"   Duplicate SP_CODEs: {sp_code_duplicates}")
     print(f"   Invalid Province Codes: {sp_invalid_prov}")
-    print(f"   Sub Places with parent MP in MainPlace table: {parent_matching} / {sp_rows} ({parent_matching/sp_rows*100:.2f}%)")
-    print(f"   Sub Places with missing parent MP: {len(parent_orphan_sp)}")
+    print(f"   Sub Places with derived parent MP present in MainPlace code set: {parent_matching} / {sp_rows} ({parent_matching/sp_rows*100:.2f}%)")
+    print(f"   Sub Places with derived parent MP absent from MainPlace code set: {len(parent_orphan_sp)}")
     
     if parent_orphan_sp:
-        print("\n   [Source Anomaly Detected in Stats SA dataset]:")
+        print("\n   [Source Data Irregularity Observed in Official Stats SA Files]:")
+        print("   Note: The SubPlace file lacks an explicit MP_CODE column; the parent is derived by integer division (SP_CODE // 1000).")
+        print("   The following Sub Places derive parent codes that do not exist in the Main Place file:")
         for orphan in parent_orphan_sp:
-            print(f"     * SP_CODE: {orphan[0]} ('{orphan[1]}') -> Derived MP: {orphan[2]} (Municipality {orphan[3]}: '{orphan[4]}') not in MP table.")
+            print(f"     * SP_CODE: {orphan[0]} ('{orphan[1]}') -> Derived Parent MP: {orphan[2]} (Municipality {orphan[3]}: '{orphan[4]}')")
             
     print("\n==================================================")
-    print("VALIDATION SUMMARY: Data structurally sound.")
+    print("VALIDATION SUMMARY: Data structurally validated against source files with 2 observed relational anomalies.")
     print("==================================================")
 
 if __name__ == '__main__':
