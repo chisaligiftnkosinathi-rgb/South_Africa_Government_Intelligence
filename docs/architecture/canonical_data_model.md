@@ -1,4 +1,4 @@
-﻿# South African Government Intelligence Platform: Canonical Data Model & Architecture (v0.4)
+﻿# South African Government Intelligence Platform: Canonical Data Model & Architecture (v0.4.1)
 
 ## 1. Core Vision & Design Tenet
 > **"Evidence-backed reasoning with auditable provenance and fail-closed behavior when evidence is insufficient."**
@@ -37,7 +37,6 @@ erDiagram
 ---
 
 ### 2.1 The Evidence & Adjudication Layer
-*(Refer to `docs/architecture/evidence_and_provenance_model.md`, `claim_resolution_model.md`, and `canonical_relationship_model.md`)*
 
 * **`sources`**
   * `id`: UUID (PK)
@@ -61,11 +60,11 @@ erDiagram
   * `extraction_metadata`: JSONB
   * `raw_extracted_text`: Text
 
-* **`authority_rules`** (Executable legal authority adjudication)
+* **`authority_rules`** (Contextual legal authority adjudication)
   * `id`: UUID (PK)
   * `claim_predicate`: Text (e.g. `'occupies_office'`, `'issued_tender'`, `'responsible_for_function'`)
   * `source_type`: Enum (`gazette`, `tender_portal`, `municipal_site`, `auditor_general_report`, `national_treasury_api`, `council_minutes`)
-  * `authority_rank`: Integer (1 = statutory supreme, 10 = corroborating, 50 = directory listing)
+  * `authority_rank`: Integer (Adjudication precedence ordering within this specific predicate scope)
   * `can_substantiate_alone`: Boolean
   * `can_supersede_prior`: Boolean
   * `requires_corroboration`: Boolean
@@ -126,8 +125,8 @@ erDiagram
   * `effective_from`: Date
   * `effective_to`: Date (Nullable)
   * `observed_at`: Timestamptz
-  * `is_active`: Boolean
   * `created_at`: Timestamptz
+  * *Unique Identity Constraint*: `(source_entity_id, relationship_predicate, target_entity_id, effective_from)`
 
 * **`relationship_evidence`** (Strict, foreign-key enforced edge provenance)
   * `id`: UUID (PK)

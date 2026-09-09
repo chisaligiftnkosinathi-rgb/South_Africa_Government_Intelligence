@@ -43,12 +43,15 @@ sequenceDiagram
 
 1. **Evidence-First Invariant**:
    - **No bare scrapers**: Never do `scraper -> database -> AI`.
-   - Every scraped payload, document, or gazette notice must first land in `evidence_records` with an immutable SHA-256 hash, captured timestamp, and source URL before any structured entity (`institutions`, `offices`, `tenders`) or relational edge is substantiated.
-2. **Entity-Office Decoupling**:
-   - People never belong directly to an `institution`. People hold `offices` via `person_appointments`.
-   - Wards strictly belong to exactly one local municipality within a defined demarcation cycle.
-3. **Small, Coherent Commits**:
+   - Every scraped payload, document, or gazette notice must first land in `evidence_records` with an immutable SHA-256 hash, captured timestamp, and source URL before any structured entity or relationship is substantiated.
+2. **First-Class Canonical Graph Invariant**:
+   - People never belong directly to an `institution`. People relate to `offices` through first-class `relationships` using the `occupies_office` predicate.
+   - All graph edges (oversight, functions, appointments, delegations, tender issuance, awards) are modeled in the first-class `relationships` table, guaranteeing referential integrity via strict foreign keys.
+   - Wards strictly relate to exactly one local municipality (`contains_ward`) within a defined demarcation cycle.
+3. **Evidence-Backed Reasoning Boundary**:
+   - AI explainer components operate in **fail-closed mode**: if an asserted relationship lacks substantiated evidence records, the system must report insufficient evidence rather than hallucinating institutional authority.
+4. **Small, Coherent Commits**:
    - Every commit must represent a single, reviewable unit of work (e.g. `docs: ...`, `schema: ...`, `test: ...`).
    - Every change must pass verification before being committed.
-4. **Push Boundary**:
+5. **Push Boundary**:
    - Only the Product Owner runs `git push`. Antigravity creates local commits only.

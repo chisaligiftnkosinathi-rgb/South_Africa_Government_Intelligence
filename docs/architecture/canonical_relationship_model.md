@@ -1,6 +1,6 @@
-﻿# Canonical Relationship & Authority Adjudication Model
+﻿# Canonical Relationship & Authority Adjudication Model (v0.4.1)
 
-This document establishes the definitive specification for **First-Class Relationships, Strict Referential Integrity, Multi-Dimensional Claim Lifecycle, and Machine-Readable Authority Adjudication** for the South African Government Intelligence & Civic Platform.
+This document establishes the definitive specification for **First-Class Relationships, Strict Referential Integrity, Multi-Dimensional Claim Lifecycle, Relationship Deduplication, and Contextual Authority Adjudication** for the South African Government Intelligence & Civic Platform.
 
 ---
 
@@ -48,10 +48,25 @@ erDiagram
 * `effective_from`: Date (Stated legal commencement)
 * `effective_to`: Date (Nullable: active until terminated/superseded)
 * `observed_at`: Timestamptz (When verified by ingestion)
-* `is_active`: Boolean (Computed or managed active flag)
 * `created_at`: Timestamptz
 
-### 1.3 Strict Relationship Provenance (`relationship_evidence`)
+> **Note on `is_active`**:
+> Canonical truth is **computed** rather than trusting a manually toggled boolean:
+> An edge is active if and only if `effective_from <= CURRENT_DATE` AND (`effective_to IS NULL` OR `effective_to >= CURRENT_DATE`) AND it is backed by at least one `substantiated` claim.
+
+### 1.3 Relationship Identity & Deduplication Policy
+To prevent duplicate identical canonical edges during continuous ingestion:
+1. **Deduplication Key**: A canonical relationship's primary identity is defined by the compound tuple:
+   $$\text{Identity} = (\text{source\_entity\_id}, \text{relationship\_predicate}, \text{target\_entity\_id}, \text{effective\_from})$$
+2. **Ingestion Resolution Protocol**:
+   * When an extracted claim resolves to $(S, P, T, D_{\text{start}})$:
+   * If an edge with $(S, P, T, D_{\text{start}})$ exists:
+     * Ingestion **links new evidence** to the existing edge via `relationship_evidence` rather than creating a duplicate row.
+     * If new evidence refines `effective_to` or attributes, an update is applied via an audited claim.
+   * If no edge exists:
+     * A new `relationships` row is instantiated upon claim validation.
+
+### 1.4 Strict Relationship Provenance (`relationship_evidence`)
 Because `relationships` is a single canonical table, `relationship_evidence` uses direct, foreign-key enforced referential integrity:
 
 * `id`: UUID (PK)
@@ -92,59 +107,32 @@ To eliminate conflation between *where a claim is in processing* and *what the p
 └─────────────────┴──────────────────────────────────────────────────────────────────────┘
 ```
 
-### Allowed State Transitions
-* `extracted` $\to$ `normalized` $\to$ `resolved` $\to$ `validated` $\to$ `canonicalized` (Pipeline progression).
-* `unverified` $\to$ `substantiated` upon passing `authority_rules`.
-* `substantiated` $\to$ `contested` upon ingestion of a contradictory assertion before adjudication.
-* `substantiated` $\to$ `superseded` upon receipt of a newer authoritative claim with `effective_from > previous.effective_from`.
-* `substantiated` $\to$ `revoked` if an Auditor-General or High Court review sets aside the appointment or award.
+> **Strict Invariant**: There is no pseudo-status like `contested_subordinate`. A contested assertion has `assertion_status = 'contested'`. Adjudication subordination is handled by the relative `authority_rank` within that rule evaluation, leaving the higher-ranked claim as `substantiated` and the lower-ranked as `contested`.
 
 ---
 
-## 3. Machine-Readable Authority Adjudication Engine
+## 3. Contextual Authority Adjudication Engine
 
-Rather than relying on static Markdown tables or arbitrary decimal probabilities, authority is encoded into executable rules in the database.
+### 3.1 Clarification: `authority_rank` is an Ordering, Not a Truth Score
+`authority_rank` is **strictly an adjudication sorting integer within a specific `(claim_predicate, source_type)` rule context**, not a universal measure of absolute truth.
+* For `occupies_office`: Provincial Gazette has `authority_rank = 1`; Municipal Website has `authority_rank = 10`.
+* For `stipulates_tender_deadline`: Official Tender Addendum has `authority_rank = 1`; Original Bid PDF has `authority_rank = 2`; Gazette is not applicable.
 
-### 3.1 Authority Rules Table (`authority_rules`)
+### 3.2 Authority Rules Table (`authority_rules`)
 * `id`: UUID (PK)
 * `claim_predicate`: Text (e.g. `'occupies_office'`, `'issued_tender'`, `'awarded_contract'`, `'responsible_for_function'`)
 * `source_type`: Enum (`gazette`, `tender_portal`, `municipal_site`, `auditor_general_report`, `national_treasury_api`, `council_minutes`)
-* `publisher_authority_tier`: Enum (`statutory_gazette`, `statutory_portal`, `official_institutional_site`, `reputable_third_party`)
-* `authority_rank`: Integer (1 = supreme legal authority, 10 = corroborating, 50 = weak supporting)
+* `authority_rank`: Integer (Lower integer = higher precedence within this predicate scope)
 * `can_substantiate_alone`: Boolean (If true, a single evidence record can mark claim `substantiated`)
 * `can_supersede_prior`: Boolean (If true, can transition prior claims to `superseded`)
 * `requires_corroboration`: Boolean (If true, cannot substantiate without a second distinct source)
 * `statutory_instrument`: Text (e.g. `"Constitution Act 108 of 1996"`, `"MFMA S79"`, `"Public Finance Management Act"`)
 
-### 3.2 Machine Evaluation Protocol
-When a claim asserts an edge $E = (S, P, T)$:
-1. Query `authority_rules` matching predicate $P$ and the evidence's `source_type`.
-2. If competing claim $C_2$ exists for $(S, P)$ within overlapping `[effective_from, effective_to]`:
-   * Compare `authority_rank` of $C_1$ vs $C_2$.
-   * If ranks are unequal: Higher rank becomes `substantiated` (canonical edge active), lower rank becomes `contested_subordinate`.
-   * If ranks are equal: Both become `contested` (flagged for review; no edge canonicalized without manual sign-off).
-3. Record the exact rule used in `relationship_evidence.adjudication_rule_id`.
-
----
-
-## 4. Non-Destructive Temporal Traceability & Provenance Walk
-
-### Concrete Scenario: CFO of Municipality MP322
-* **2024-01-01**: Municipal Gazette 100 appoints **Person W** as CFO.
-  * Canonical Edge: `(Person W) -[occupies_office]-> (Office: CFO)` (`effective_from: 2024-01-01`, `effective_to: 2026-07-31`).
-* **2026-08-01**: Provincial Gazette 3412 appoints **Person X** as Acting CFO.
-  * Canonical Edge 1 updated: `effective_to = 2026-07-31`, `assertion_status = 'superseded'`.
-  * Canonical Edge 2 created: `(Person X) -[occupies_office]-> (Office: CFO)` (`effective_from: 2026-08-01`, `effective_to: null`, `assertion_status = 'substantiated'`).
-* **2026-09-01**: Ingestion captures municipal website still listing **Person W**.
-  * Extraction creates Claim: `(Person W) -[occupies_office]-> (Office: CFO)`.
-  * Adjudication evaluates: Website (`authority_rank = 50`) vs Gazette (`authority_rank = 1`).
-  * Website claim marked `contested_subordinate`, does **not** alter Canonical Edge 2.
-
-### Auditable Query Walk (The "Why" Trace):
-$$\text{Query: "Who is the CFO of Mbombela and why?"}$$
-$$\Downarrow$$
-1. `relationships` $\to$ Active edge: `(Person X) -[occupies_office {acting: true}]-> (CFO Office)`
-2. `relationship_evidence` $\to$ Links to `claim_id` and `evidence_record_id` (Provincial Gazette 3412)
-3. `authority_rules` $\to$ Rule: *Gazette appointment notice supersedes municipal directory (`rank = 1` vs `rank = 50`)*
-4. `evidence_records` $\to$ Returns SHA-256 hash, PDF URI, capture timestamp, and verbatim excerpt:
-   > *"Notice is hereby given in terms of Section 56 of the Systems Act that Dr. X is appointed Acting CFO effective 1 August 2026."*
+### 3.3 Conflict Resolution Protocol
+When a claim asserts edge $E_1 = (S, P, T)$ that conflicts with existing assertion $E_2 = (S, P, T')$:
+1. Both claims remain in `claims` (zero loss of historical evidence).
+2. Query `authority_rules` for predicate $P$ across the source types of $E_1$ and $E_2$.
+3. If one rule has a strictly lower `authority_rank` (higher precedence):
+   * Higher-precedence claim becomes `substantiated` (canonical edge active).
+   * Lower-precedence claim becomes `contested` (flagged, inactive, with `contested_by_claim_id` pointing to the superior claim).
+4. If ranks are identical: Both become `contested` until manual administrative review.
